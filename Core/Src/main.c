@@ -32,6 +32,8 @@
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 #define BUTTON_DEBOUNCE_MS 200U
+#define UART_LOG_QUEUE_DEPTH 8U
+#define UART_LOG_MSG_MAX_LEN 96U
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -48,6 +50,10 @@ volatile uint32_t g_blink_ms = 500;
 volatile uint8_t g_button_event = 0;
 volatile uint32_t g_next_toggle_tick = 0;
 volatile uint32_t g_last_button_tick = 0;
+static char g_uart_log_queue[UART_LOG_QUEUE_DEPTH][UART_LOG_MSG_MAX_LEN];
+volatile uint8_t g_uart_log_head = 0;
+volatile uint8_t g_uart_log_tail = 0;
+volatile uint8_t g_uart_tx_busy = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -57,14 +63,70 @@ static void MX_GPIO_Init(void);
 static void MX_ICACHE_Init(void);
 static void MX_USART3_UART_Init(void);
 /* USER CODE BEGIN PFP */
+static uint8_t UartLogNextIndex(uint8_t index);
+static void UartLogStartTxIfIdle(void);
 static void LogUart(const char *msg);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+static uint8_t UartLogNextIndex(uint8_t index)
+{
+  return (uint8_t)((index + 1U) % UART_LOG_QUEUE_DEPTH);
+}
+
+static void UartLogStartTxIfIdle(void)
+{
+  uint8_t tail_local;
+  uint16_t len;
+  HAL_StatusTypeDef status;
+
+  __disable_irq();
+  if ((g_uart_tx_busy != 0U) || (g_uart_log_head == g_uart_log_tail))
+  {
+    __enable_irq();
+    return;
+  }
+
+  g_uart_tx_busy = 1U;
+  tail_local = g_uart_log_tail;
+  len = (uint16_t)strlen(g_uart_log_queue[tail_local]);
+  __enable_irq();
+
+  status = HAL_UART_Transmit_IT(&huart3, (uint8_t *)g_uart_log_queue[tail_local], len);
+  if (status != HAL_OK)
+  {
+    __disable_irq();
+    g_uart_tx_busy = 0U;
+    __enable_irq();
+  }
+}
+
 static void LogUart(const char *msg)
 {
-  HAL_UART_Transmit(&huart3, (uint8_t *)msg, (uint16_t)strlen(msg), HAL_MAX_DELAY);
+  uint8_t head_local;
+  uint8_t next_head;
+
+  if (msg == NULL)
+  {
+    return;
+  }
+
+  __disable_irq();
+  head_local = g_uart_log_head;
+  next_head = UartLogNextIndex(head_local);
+  if (next_head == g_uart_log_tail)
+  {
+    __enable_irq();
+    return;
+  }
+
+  (void)strncpy(g_uart_log_queue[head_local], msg, UART_LOG_MSG_MAX_LEN - 1U);
+  g_uart_log_queue[head_local][UART_LOG_MSG_MAX_LEN - 1U] = '\0';
+  g_uart_log_head = next_head;
+  __enable_irq();
+
+  UartLogStartTxIfIdle();
 }
 
 void HAL_GPIO_EXTI_Rising_Callback(uint16_t GPIO_Pin)
@@ -81,6 +143,21 @@ void HAL_GPIO_EXTI_Rising_Callback(uint16_t GPIO_Pin)
     g_blink_ms = (g_blink_ms == 500U) ? 100U : 500U;
     g_button_event = 1U;
   }
+}
+
+void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
+{
+  if (huart->Instance != USART3)
+  {
+    return;
+  }
+
+  __disable_irq();
+  g_uart_log_tail = UartLogNextIndex(g_uart_log_tail);
+  g_uart_tx_busy = 0U;
+  __enable_irq();
+
+  UartLogStartTxIfIdle();
 }
 /* USER CODE END 0 */
 
@@ -120,7 +197,8 @@ int main(void)
   MX_USART3_UART_Init();
   /* USER CODE BEGIN 2 */
   g_next_toggle_tick = HAL_GetTick() + g_blink_ms;
-  LogUart("\r\nLAB3 started: non-blocking blink + button debounce.\r\n");
+  LogUart("\r\nLAB4 started: non-blocking UART logging with interrupt queue.\r\n");
+  LogUart("UART mode: HAL_UART_Transmit_IT (USART3 IRQ).\r\n");
   LogUart("Debounce window: 200 ms.\r\n");
   LogUart("Press USER button to change blink speed.\r\n");
   /* USER CODE END 2 */
@@ -154,6 +232,7 @@ int main(void)
       }
     }
 
+    UartLogStartTxIfIdle();
     __WFI();
   }
   /* USER CODE END 3 */
@@ -290,6 +369,8 @@ static void MX_USART3_UART_Init(void)
     Error_Handler();
   }
   /* USER CODE BEGIN USART3_Init 2 */
+  HAL_NVIC_SetPriority(USART3_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(USART3_IRQn);
 
   /* USER CODE END USART3_Init 2 */
 
