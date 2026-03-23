@@ -31,7 +31,7 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-
+#define BUTTON_DEBOUNCE_MS 200U
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -47,6 +47,7 @@ UART_HandleTypeDef huart3;
 volatile uint32_t g_blink_ms = 500;
 volatile uint8_t g_button_event = 0;
 volatile uint32_t g_next_toggle_tick = 0;
+volatile uint32_t g_last_button_tick = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -70,6 +71,13 @@ void HAL_GPIO_EXTI_Rising_Callback(uint16_t GPIO_Pin)
 {
   if (GPIO_Pin == B1_Pin)
   {
+    uint32_t now = HAL_GetTick();
+    if ((now - g_last_button_tick) < BUTTON_DEBOUNCE_MS)
+    {
+      return;
+    }
+
+    g_last_button_tick = now;
     g_blink_ms = (g_blink_ms == 500U) ? 100U : 500U;
     g_button_event = 1U;
   }
@@ -112,7 +120,8 @@ int main(void)
   MX_USART3_UART_Init();
   /* USER CODE BEGIN 2 */
   g_next_toggle_tick = HAL_GetTick() + g_blink_ms;
-  LogUart("\r\nLAB2 started: non-blocking blink enabled.\r\n");
+  LogUart("\r\nLAB3 started: non-blocking blink + button debounce.\r\n");
+  LogUart("Debounce window: 200 ms.\r\n");
   LogUart("Press USER button to change blink speed.\r\n");
   /* USER CODE END 2 */
 
