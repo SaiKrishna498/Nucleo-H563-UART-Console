@@ -46,6 +46,7 @@ UART_HandleTypeDef huart3;
 /* USER CODE BEGIN PV */
 volatile uint32_t g_blink_ms = 500;
 volatile uint8_t g_button_event = 0;
+volatile uint32_t g_next_toggle_tick = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -110,7 +111,9 @@ int main(void)
   MX_ICACHE_Init();
   MX_USART3_UART_Init();
   /* USER CODE BEGIN 2 */
-  LogUart("\r\nLAB1 started: press USER button to change blink speed.\r\n");
+  g_next_toggle_tick = HAL_GetTick() + g_blink_ms;
+  LogUart("\r\nLAB2 started: non-blocking blink enabled.\r\n");
+  LogUart("Press USER button to change blink speed.\r\n");
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -120,12 +123,18 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    HAL_GPIO_TogglePin(LD2_GPIO_Port, LD2_Pin);
-    HAL_Delay(g_blink_ms);
+    uint32_t now = HAL_GetTick();
+
+    if ((int32_t)(now - g_next_toggle_tick) >= 0)
+    {
+      HAL_GPIO_TogglePin(LD2_GPIO_Port, LD2_Pin);
+      g_next_toggle_tick = now + g_blink_ms;
+    }
 
     if (g_button_event != 0U)
     {
       g_button_event = 0U;
+      g_next_toggle_tick = now + g_blink_ms;
       if (g_blink_ms == 100U)
       {
         LogUart("Button event -> fast blink (100 ms)\r\n");
@@ -135,6 +144,8 @@ int main(void)
         LogUart("Button event -> slow blink (500 ms)\r\n");
       }
     }
+
+    __WFI();
   }
   /* USER CODE END 3 */
 }
