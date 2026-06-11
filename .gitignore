@@ -1,0 +1,18 @@
+# STM32CubeIDE workspace metadata
+.metadata/
+
+# Build outputs
+**/Debug/
+**/Release/
+**/build/
+
+# Common generated files
+*.o
+*.d
+*.su
+*.map
+*.elf
+*.bin
+*.hex
+*.list
+*.tmp
