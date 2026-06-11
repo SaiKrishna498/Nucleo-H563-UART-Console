@@ -21,6 +21,9 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include <ctype.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 /* USER CODE END Includes */
 
@@ -32,8 +35,10 @@
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 #define BUTTON_DEBOUNCE_MS 200U
-#define UART_LOG_QUEUE_DEPTH 8U
+#define UART_LOG_QUEUE_DEPTH 16U
 #define UART_LOG_MSG_MAX_LEN 96U
+#define UART_RX_FIFO_DEPTH 32U
+#define UART_CONSOLE_LINE_MAX_LEN 64U
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -54,6 +59,17 @@ static char g_uart_log_queue[UART_LOG_QUEUE_DEPTH][UART_LOG_MSG_MAX_LEN];
 volatile uint8_t g_uart_log_head = 0;
 volatile uint8_t g_uart_log_tail = 0;
 volatile uint8_t g_uart_tx_busy = 0;
+volatile uint8_t g_uart_rx_byte = 0;
+static uint8_t g_uart_rx_fifo[UART_RX_FIFO_DEPTH];
+volatile uint8_t g_uart_rx_head = 0;
+volatile uint8_t g_uart_rx_tail = 0;
+volatile uint8_t g_uart_rx_overflow = 0;
+static char g_console_line[UART_CONSOLE_LINE_MAX_LEN];
+static char g_console_cmd[UART_CONSOLE_LINE_MAX_LEN];
+uint8_t g_console_line_len = 0;
+volatile uint8_t g_console_cmd_ready = 0;
+uint32_t g_console_baud_rate = 115200U;
+const char *g_console_format_name = "8N1";
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -64,8 +80,27 @@ static void MX_ICACHE_Init(void);
 static void MX_USART3_UART_Init(void);
 /* USER CODE BEGIN PFP */
 static uint8_t UartLogNextIndex(uint8_t index);
+static uint8_t UartRxNextIndex(uint8_t index);
 static void UartLogStartTxIfIdle(void);
+static void UartWaitForTxDrain(void);
 static void LogUart(const char *msg);
+static void StartConsoleRx(void);
+static uint8_t UartRxPopByte(uint8_t *byte);
+static void ConsolePrintPrompt(void);
+static void ConsolePrintHelp(void);
+static void ConsolePrintCurrentUart(void);
+static void ConsoleHandleByte(uint8_t byte);
+static void ConsoleProcessRx(void);
+static void ConsoleProcessCommand(void);
+static uint8_t ConsoleTryParseFormat(const char *token,
+                                     uint32_t *word_length,
+                                     uint32_t *parity,
+                                     uint32_t *stop_bits,
+                                     const char **format_name);
+static HAL_StatusTypeDef ConsoleApplyUartConfig(uint32_t baud_rate,
+                                                uint32_t word_length,
+                                                uint32_t parity,
+                                                uint32_t stop_bits);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -73,6 +108,11 @@ static void LogUart(const char *msg);
 static uint8_t UartLogNextIndex(uint8_t index)
 {
   return (uint8_t)((index + 1U) % UART_LOG_QUEUE_DEPTH);
+}
+
+static uint8_t UartRxNextIndex(uint8_t index)
+{
+  return (uint8_t)((index + 1U) % UART_RX_FIFO_DEPTH);
 }
 
 static void UartLogStartTxIfIdle(void)
@@ -129,6 +169,371 @@ static void LogUart(const char *msg)
   UartLogStartTxIfIdle();
 }
 
+static void UartWaitForTxDrain(void)
+{
+  while (1)
+  {
+    uint8_t tx_idle;
+
+    __disable_irq();
+    tx_idle = (uint8_t)(((g_uart_tx_busy == 0U) && (g_uart_log_head == g_uart_log_tail)) ? 1U : 0U);
+    __enable_irq();
+
+    if (tx_idle != 0U)
+    {
+      break;
+    }
+
+    UartLogStartTxIfIdle();
+  }
+}
+
+static void StartConsoleRx(void)
+{
+  if (HAL_UART_Receive_IT(&huart3, (uint8_t *)&g_uart_rx_byte, 1U) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+static uint8_t UartRxPopByte(uint8_t *byte)
+{
+  uint8_t tail_local;
+
+  if (byte == NULL)
+  {
+    return 0U;
+  }
+
+  __disable_irq();
+  if (g_uart_rx_head == g_uart_rx_tail)
+  {
+    __enable_irq();
+    return 0U;
+  }
+
+  tail_local = g_uart_rx_tail;
+  *byte = g_uart_rx_fifo[tail_local];
+  g_uart_rx_tail = UartRxNextIndex(tail_local);
+  __enable_irq();
+
+  return 1U;
+}
+
+static void ConsolePrintPrompt(void)
+{
+  LogUart("> ");
+}
+
+static void ConsolePrintHelp(void)
+{
+  LogUart("Commands:\r\n");
+  LogUart("  help\r\n");
+  LogUart("  uart show\r\n");
+  LogUart("  uart set <baud> <8n1|8e1|8o1|8n2>\r\n");
+}
+
+static void ConsolePrintCurrentUart(void)
+{
+  char msg[UART_LOG_MSG_MAX_LEN];
+
+  (void)snprintf(msg,
+                 sizeof(msg),
+                 "UART console: %lu %s\r\n",
+                 (unsigned long)g_console_baud_rate,
+                 g_console_format_name);
+  LogUart(msg);
+}
+
+static void ConsoleHandleByte(uint8_t byte)
+{
+  char echo[2];
+
+  if ((byte == '\r') || (byte == '\n'))
+  {
+    if (g_console_line_len != 0U)
+    {
+      g_console_line[g_console_line_len] = '\0';
+      if (g_console_cmd_ready == 0U)
+      {
+        (void)strncpy(g_console_cmd, g_console_line, sizeof(g_console_cmd) - 1U);
+        g_console_cmd[sizeof(g_console_cmd) - 1U] = '\0';
+        g_console_cmd_ready = 1U;
+      }
+      else
+      {
+        LogUart("\r\nCommand dropped: previous command still pending.\r\n");
+      }
+
+      g_console_line_len = 0U;
+    }
+    else
+    {
+      LogUart("\r\n");
+      ConsolePrintPrompt();
+      return;
+    }
+
+    LogUart("\r\n");
+    return;
+  }
+
+  if ((byte == '\b') || (byte == 0x7FU))
+  {
+    if (g_console_line_len != 0U)
+    {
+      g_console_line_len--;
+      LogUart("\b \b");
+    }
+
+    return;
+  }
+
+  if (isprint((int)byte) == 0)
+  {
+    return;
+  }
+
+  if (g_console_line_len >= (UART_CONSOLE_LINE_MAX_LEN - 1U))
+  {
+    return;
+  }
+
+  g_console_line[g_console_line_len] = (char)byte;
+  g_console_line_len++;
+
+  echo[0] = (char)byte;
+  echo[1] = '\0';
+  LogUart(echo);
+}
+
+static uint8_t ConsoleTryParseFormat(const char *token,
+                                     uint32_t *word_length,
+                                     uint32_t *parity,
+                                     uint32_t *stop_bits,
+                                     const char **format_name)
+{
+  char normalized[8];
+  size_t idx;
+
+  if ((token == NULL) || (word_length == NULL) || (parity == NULL) || (stop_bits == NULL) || (format_name == NULL))
+  {
+    return 0U;
+  }
+
+  for (idx = 0U; idx < (sizeof(normalized) - 1U); idx++)
+  {
+    if (token[idx] == '\0')
+    {
+      break;
+    }
+
+    normalized[idx] = (char)tolower((int)(unsigned char)token[idx]);
+  }
+  normalized[idx] = '\0';
+
+  if (strcmp(normalized, "8n1") == 0)
+  {
+    *word_length = UART_WORDLENGTH_8B;
+    *parity = UART_PARITY_NONE;
+    *stop_bits = UART_STOPBITS_1;
+    *format_name = "8N1";
+    return 1U;
+  }
+
+  if (strcmp(normalized, "8e1") == 0)
+  {
+    *word_length = UART_WORDLENGTH_9B;
+    *parity = UART_PARITY_EVEN;
+    *stop_bits = UART_STOPBITS_1;
+    *format_name = "8E1";
+    return 1U;
+  }
+
+  if (strcmp(normalized, "8o1") == 0)
+  {
+    *word_length = UART_WORDLENGTH_9B;
+    *parity = UART_PARITY_ODD;
+    *stop_bits = UART_STOPBITS_1;
+    *format_name = "8O1";
+    return 1U;
+  }
+
+  if (strcmp(normalized, "8n2") == 0)
+  {
+    *word_length = UART_WORDLENGTH_8B;
+    *parity = UART_PARITY_NONE;
+    *stop_bits = UART_STOPBITS_2;
+    *format_name = "8N2";
+    return 1U;
+  }
+
+  return 0U;
+}
+
+static HAL_StatusTypeDef ConsoleApplyUartConfig(uint32_t baud_rate,
+                                                uint32_t word_length,
+                                                uint32_t parity,
+                                                uint32_t stop_bits)
+{
+  (void)HAL_UART_AbortReceive_IT(&huart3);
+
+  if (HAL_UART_DeInit(&huart3) != HAL_OK)
+  {
+    return HAL_ERROR;
+  }
+
+  huart3.Instance = USART3;
+  huart3.Init.BaudRate = baud_rate;
+  huart3.Init.WordLength = word_length;
+  huart3.Init.StopBits = stop_bits;
+  huart3.Init.Parity = parity;
+  huart3.Init.Mode = UART_MODE_TX_RX;
+  huart3.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart3.Init.OverSampling = UART_OVERSAMPLING_16;
+  huart3.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
+  huart3.Init.ClockPrescaler = UART_PRESCALER_DIV1;
+  huart3.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
+
+  if (HAL_UART_Init(&huart3) != HAL_OK)
+  {
+    return HAL_ERROR;
+  }
+
+  if (HAL_UARTEx_SetTxFifoThreshold(&huart3, UART_TXFIFO_THRESHOLD_1_8) != HAL_OK)
+  {
+    return HAL_ERROR;
+  }
+
+  if (HAL_UARTEx_SetRxFifoThreshold(&huart3, UART_RXFIFO_THRESHOLD_1_8) != HAL_OK)
+  {
+    return HAL_ERROR;
+  }
+
+  if (HAL_UARTEx_DisableFifoMode(&huart3) != HAL_OK)
+  {
+    return HAL_ERROR;
+  }
+
+  StartConsoleRx();
+  return HAL_OK;
+}
+
+static void ConsoleProcessCommand(void)
+{
+  char *command;
+  char *subcommand;
+  char *baud_token;
+  char *format_token;
+  char *extra_token;
+  char *end_ptr;
+  char msg[UART_LOG_MSG_MAX_LEN];
+  uint32_t baud_rate;
+  uint32_t word_length;
+  uint32_t parity;
+  uint32_t stop_bits;
+  const char *format_name;
+
+  command = strtok(g_console_cmd, " ");
+  if (command == NULL)
+  {
+    return;
+  }
+
+  if (strcmp(command, "help") == 0)
+  {
+    ConsolePrintHelp();
+    return;
+  }
+
+  if (strcmp(command, "uart") != 0)
+  {
+    LogUart("Unknown command. Type 'help'.\r\n");
+    return;
+  }
+
+  subcommand = strtok(NULL, " ");
+  if (subcommand == NULL)
+  {
+    LogUart("Usage: uart show | uart set <baud> <format>\r\n");
+    return;
+  }
+
+  if (strcmp(subcommand, "show") == 0)
+  {
+    ConsolePrintCurrentUart();
+    return;
+  }
+
+  if (strcmp(subcommand, "set") != 0)
+  {
+    LogUart("Usage: uart show | uart set <baud> <format>\r\n");
+    return;
+  }
+
+  baud_token = strtok(NULL, " ");
+  format_token = strtok(NULL, " ");
+  extra_token = strtok(NULL, " ");
+  if ((baud_token == NULL) || (format_token == NULL) || (extra_token != NULL))
+  {
+    LogUart("Usage: uart set <baud> <8n1|8e1|8o1|8n2>\r\n");
+    return;
+  }
+
+  baud_rate = strtoul(baud_token, &end_ptr, 10);
+  if ((*baud_token == '\0') || (*end_ptr != '\0') || (baud_rate < 1200U) || (baud_rate > 1000000U))
+  {
+    LogUart("Baud must be an integer in the range 1200..1000000.\r\n");
+    return;
+  }
+
+  if (ConsoleTryParseFormat(format_token, &word_length, &parity, &stop_bits, &format_name) == 0U)
+  {
+    LogUart("Format must be one of: 8n1, 8e1, 8o1, 8n2.\r\n");
+    return;
+  }
+
+  (void)snprintf(msg,
+                 sizeof(msg),
+                 "Applying UART console: %lu %s. Update terminal now.\r\n",
+                 (unsigned long)baud_rate,
+                 format_name);
+  LogUart(msg);
+  UartWaitForTxDrain();
+
+  if (ConsoleApplyUartConfig(baud_rate, word_length, parity, stop_bits) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  g_console_baud_rate = baud_rate;
+  g_console_format_name = format_name;
+  LogUart("\r\nUART reconfigured.\r\n");
+  ConsolePrintCurrentUart();
+}
+
+static void ConsoleProcessRx(void)
+{
+  uint8_t byte;
+
+  while (UartRxPopByte(&byte) != 0U)
+  {
+    ConsoleHandleByte(byte);
+  }
+
+  __disable_irq();
+  if (g_uart_rx_overflow != 0U)
+  {
+    g_uart_rx_overflow = 0U;
+    __enable_irq();
+    LogUart("\r\nRX overflow: input dropped.\r\n");
+  }
+  else
+  {
+    __enable_irq();
+  }
+}
+
 void HAL_GPIO_EXTI_Rising_Callback(uint16_t GPIO_Pin)
 {
   if (GPIO_Pin == B1_Pin)
@@ -158,6 +563,45 @@ void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
   __enable_irq();
 
   UartLogStartTxIfIdle();
+}
+
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+  uint8_t next_head;
+
+  if (huart->Instance != USART3)
+  {
+    return;
+  }
+
+  next_head = UartRxNextIndex(g_uart_rx_head);
+  if (next_head == g_uart_rx_tail)
+  {
+    g_uart_rx_overflow = 1U;
+  }
+  else
+  {
+    g_uart_rx_fifo[g_uart_rx_head] = g_uart_rx_byte;
+    g_uart_rx_head = next_head;
+  }
+
+  if (HAL_UART_Receive_IT(&huart3, (uint8_t *)&g_uart_rx_byte, 1U) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+{
+  if (huart->Instance != USART3)
+  {
+    return;
+  }
+
+  if (HAL_UART_Receive_IT(&huart3, (uint8_t *)&g_uart_rx_byte, 1U) != HAL_OK)
+  {
+    Error_Handler();
+  }
 }
 /* USER CODE END 0 */
 
@@ -201,6 +645,9 @@ int main(void)
   LogUart("UART mode: HAL_UART_Transmit_IT (USART3 IRQ).\r\n");
   LogUart("Debounce window: 200 ms.\r\n");
   LogUart("Press USER button to change blink speed.\r\n");
+  LogUart("Console commands: help, uart show, uart set <baud> <format>\r\n");
+  StartConsoleRx();
+  ConsolePrintPrompt();
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -211,6 +658,8 @@ int main(void)
 
     /* USER CODE BEGIN 3 */
     uint32_t now = HAL_GetTick();
+
+    ConsoleProcessRx();
 
     if ((int32_t)(now - g_next_toggle_tick) >= 0)
     {
@@ -230,6 +679,13 @@ int main(void)
       {
         LogUart("Button event -> slow blink (500 ms)\r\n");
       }
+    }
+
+    if (g_console_cmd_ready != 0U)
+    {
+      g_console_cmd_ready = 0U;
+      ConsoleProcessCommand();
+      ConsolePrintPrompt();
     }
 
     UartLogStartTxIfIdle();
